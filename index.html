@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arcade Combat</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: #0a0a14;
+    color: #e8e8f5;
+    font-family: "Trebuchet MS", Arial, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #wrap { width: min(960px, 100vw); }
+  canvas {
+    display: block; width: 100%; height: auto;
+    background: #111; border: 3px solid #444;
+    box-shadow: 0 0 40px #000a;
+    image-rendering: pixelated;
+  }
+  #aide { text-align: center; font-size: 13px; color: #8888a8; padding: 8px 4px; }
+  #aide b { color: #cfcfeb; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="jeu" width="960" height="540"></canvas>
+  <div id="aide">
+    <b>J/K/L</b> : coup de poing / coup de pied / boule de feu &nbsp;•&nbsp;
+    <b>A/D</b> : bouger &nbsp;•&nbsp; <b>W</b> : sauter &nbsp;•&nbsp; <b>S</b> : garder &nbsp;•&nbsp;
+    <b>Entrée</b> : rejouer
+  </div>
+</div>
+<script>
+"use strict";
+const canvas = document.getElementById("jeu");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+const SOL = 462;           // ligne de sol (pieds des combattants)
+const LARGEUR = 46, HAUTEUR = 104;
+
+// --- entrées clavier ---
+const touches = Object.create(null);
+addEventListener("keydown", e => {
+  if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," "].includes(e.key)) e.preventDefault();
+  touches[e.code] = true;
+});
+addEventListener("keyup", e => { touches[e.code] = false; });
+const presse = code => touches[code] === true;
+
+// --- données des coups ---
+const COUPS = {
+  poing:   { degat: 7,  debut: 3, fin: 8,  duree: 16, portee: 58, recul: 70,  special: false },
+  pied:    { degat: 12, debut: 5, fin: 11, duree: 24, portee: 78, recul: 130, special: false },
+  boule:   { degat: 14, debut: 8, fin: 9,  duree: 26, portee: 0,  recul: 0,   special: true  }
+};
+
+function creerCombattant(x, couleur, nom) {
+  return {
+    x, y: SOL, vx: 0, vy: 0,
+    facing: 1, couleur, nom,
+    pv: 100, victoires: 0,
+    etat: "debout", tempo: 0,
+    coup: null, coupTemps: 0, coupFrappe: false,
+    garde: false, hitstun: 0, cooldownSpec: 0,
+    // IA
+    pensee: 0, intention: null, dirAvance: -1
+  };
+}
+
+let joueur, ia, projectiles, effets, phase, roundTemps, vainqueurRound, shake, announce;
+
+function resetRound() {
+  joueur = creerCombattant(280, "#3fa9f5", "JOUEUR");
+  ia = creerCombattant(680, "#f5544f", "IA");
+  joueur.victoires = scoreJ; ia.victoires = scoreI;
+  joueur.facing = 1; ia.facing = -1;
+  projectiles = []; effets = [];
+  roundTemps = 60;
+  vainqueurRound = null;
+  shake = 0;
+  announce = { texte: "ROUND " + (scoreJ + scoreI + 1), temps: 1.2 };
+}
+let scoreJ = 0, scoreI = 0;
+
+function demarrerMatch() {
+  scoreJ = 0; scoreI = 0;
+  resetRound();
+  phase = "combat";
+}
+
+function boost(t, d) { // compte à rebours d'un timer
+  return t > 0 ? Math.max(0, t - d) : 0;
+}
+
+function hitbox(f) {
+  const c = COUPS[f.coup];
+  const depart = f.x + f.facing * (LARGEUR / 2);
+  return {
+    x: f.facing > 0 ? depart : depart - c.portee,
+    y: f.y - HAUTEUR + 8,
+    w: c.portee,
+    h: 70
+  };
+}
+function hurtbox(f) {
+  return { x: f.x - LARGEUR / 2, y: f.y - HAUTEUR, w: LARGEUR, h: HAUTEUR };
+}
+function chevauche(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function lancerCoup(f, type) {
+  if (f.etat === "ko" || f.hitstun > 0 || f.coup) return;
+  if (type === "boule") {
+    if (f.cooldownSpec > 0) return;
+    f.cooldownSpec = 2.2;
+  }
+  f.coup = type; f.coupTemps = 0; f.coupFrappe = false;
+}
+
+function effectuerImpact(attaquant, cible, type) {
+  const c = COUPS[type];
+  let degat = c.degat;
+  const bloque = cible.garde && cible.facing === -attaquant.facing && cible.etat !== "ko";
+  if (bloque) degat = Math.ceil(degat * 0.2);
+  cible.pv = Math.max(0, cible.pv - degat);
+  const sens = attaquant.facing;
+  if (!bloque) {
+    cible.hitstun = type === "pied" ? 0.45 : 0.28;
+    cible.vx = sens * c.recul;
+    cible.vy = type === "pied" ? -170 : -70;
+    cible.coup = null;
+    shake = type === "pied" ? 10 : 5;
+  } else {
+    cible.vx = sens * 35;
+    shake = 2;
+  }
+  for (let i = 0; i < (bloque ? 6 : 12); i++) {
+    effets.push({
+      x: cible.x - sens * 10, y: cible.y - HAUTEUR * 0.6,
+      vx: (Math.random() - 0.5) * 260 + sens * 40,
+      vy: (Math.random() - 0.5) * 260,
+      vie: 0.3 + Math.random() * 0.2,
+      couleur: bloque ? "#9fd0ff" : "#ffe066"
+    });
+  }
+}
+
+function mettreKO(f) {
+  f.etat = "ko"; f.coup = null; f.vx = 0;
+  f.vy = -260;
+  phase = "roundFin";
+  if (f === ia) { scoreJ++; vainqueurRound = "JOUEUR"; }
+  else { scoreI++; vainqueurRound = "IA"; }
+  announce = { texte: "K.O.  " + vainqueurRound + " GAGNE !", temps: 2 };
+}
+
+function physique(f, dt) {
+  if (f.etat === "ko") {
+    f.x += f.vx * dt;
+    f.y += f.vy * dt; f.vy += 900 * dt;
+    if (f.y > SOL) { f.y = SOL; f.vy = 0; }
+    f.x = Math.max(LARGEUR / 2, Math.min(W - LARGEUR / 2, f.x));
+    return;
+  }
+
+  f.hitstun = boost(f.hitstun, dt);
+  f.cooldownSpec = boost(f.cooldownSpec, dt);
+
+  const libre = f.hitstun <= 0 && !f.coup;
+
+  if (f.coup) {
+    f.coupTemps += dt * 60;
+    const c = COUPS[f.coup];
+    if (c.special) {
+      if (f.coupTemps >= c.debut && !f.coupFrappe) {
+        f.coupFrappe = true;
+        projectiles.push({
+          x: f.x + f.facing * (LARGEUR / 2 + 12),
+          y: f.y - 60, vx: f.facing * 430, vie: 2.4,
+          owner: f, couleur: f.couleur
+        });
+      }
+    } else if (f.coupTemps >= c.debut && f.coupTemps <= c.fin && !f.coupFrappe) {
+      const cible = f === joueur ? ia : joueur;
+      if (cible.etat !== "ko" && chevauche(hitbox(f), hurtbox(cible))) {
+        f.coupFrappe = true;
+        effectuerImpact(f, cible, f.coup);
+        if (cible.pv <= 0) mettreKO(cible);
+      }
+    }
+    if (f.coupTemps >= c.duree) f.coup = null;
+  }
+
+  // garde (S pour le joueur, décision IA)
+  f.garde = libre && f.y >= SOL - 1 && f.gardeDemande === true;
+
+  if (libre) {
+    if (f === joueur) {
+      const gauche = presse("KeyA") || presse("ArrowLeft");
+      const droite = presse("KeyD") || presse("ArrowRight");
+      const dir = (droite ? 1 : 0) - (gauche ? 1 : 0);
+      f.vx = f.garde ? 0 : dir * 240;
+      if (!f.garde && f.y >= SOL && (presse("KeyW") || presse("ArrowUp") || presse("Space"))) {
+        f.vy = -470;
+      }
+      f.gardeDemande = presse("KeyS") || presse("ArrowDown");
+      if (presse("KeyJ")) lancerCoup(f, "poing");
+      else if (presse("KeyK")) lancerCoup(f, "pied");
+      else if (presse("KeyL")) lancerCoup(f, "boule");
+    } else {
+      f.vx = f.intention === "avance" ? f.dirAvance * 210 : f.intention === "recul" ? -f.dirAvance * 160 : 0;
+    }
+  } else if (f.hitstun > 0) {
+    f.vx *= Math.pow(0.02, dt);
+  } else {
+    f.vx = 0;
+  }
+
+  f.x += f.vx * dt;
+  f.y += f.vy * dt;
+  f.vy += 1200 * dt;
+  if (f.y >= SOL) { f.y = SOL; f.vy = 0; }
+  f.x = Math.max(LARGEUR / 2, Math.min(W - LARGEUR / 2, f.x));
+}
+
+function penserIA(dt) {
+  ia.pensee -= dt;
+  if (ia.pensee > 0 || ia.etat === "ko" || ia.hitstun > 0 || ia.coup) return;
+  ia.pensee = 0.15 + Math.random() * 0.25;
+  const dist = Math.abs(ia.x - joueur.x);
+  const direction = joueur.x < ia.x ? -1 : 1;
+  ia.facing = direction; ia.dirAvance = direction;
+
+  // parer parfois quand le joueur attaque
+  if (joueur.coup && dist < 130 && Math.random() < 0.35) {
+    ia.gardeDemande = true; ia.intention = null;
+    ia.pensee = 0.3;
+    return;
+  }
+  ia.gardeDemande = false;
+
+  if (dist > 110) {
+    ia.intention = "avance";
+    if (Math.random() < 0.12 && ia.y >= SOL) ia.vy = -430;
+    if (Math.random() < 0.06 && dist > 300) lancerCoup(ia, "boule");
+  } else {
+    ia.intention = Math.random() < 0.25 ? "recul" : null;
+    const r = Math.random();
+    if (r < 0.34) lancerCoup(ia, "poing");
+    else if (r < 0.6) lancerCoup(ia, "pied");
+    else if (r < 0.68) lancerCoup(ia, "boule");
+  }
+}
+
+function majProjectiles(dt) {
+  for (const p of projectiles) {
+    p.x += p.vx * dt; p.vie -= dt;
+    const cible = p.owner === joueur ? ia : joueur;
+    if (cible.etat !== "ko" && chevauche({ x: p.x - 14, y: p.y - 14, w: 28, h: 28 }, hurtbox(cible))) {
+      effectuerImpact(p.owner, cible, "boule");
+      p.vie = 0;
+      if (cible.pv <= 0) mettreKO(cible);
+    }
+  }
+  projectiles = projectiles.filter(p => p.vie > 0 && p.x > -40 && p.x < W + 40);
+}
+
+function majEffets(dt) {
+  for (const e of effets) {
+    e.x += e.vx * dt; e.y += e.vy * dt;
+    e.vy += 500 * dt; e.vie -= dt;
+  }
+  effets = effets.filter(e => e.vie > 0);
+}
+
+function maj(dt) {
+  shake = boost(shake, dt);
+  if (announce) { announce.temps -= dt; if (announce.temps <= 0) announce = null; }
+
+  if (phase === "menu") {
+    if (presse("Enter")) demarrerMatch();
+    return;
+  }
+  if (phase === "roundFin") {
+    physique(joueur, dt); physique(ia, dt);
+    majProjectiles(dt); majEffets(dt);
+    if (announce === null) {
+      if (scoreJ >= 2 || scoreI >= 2 || roundTemps <= 0) {
+        phase = "matchFin";
+        announce = {
+          texte: scoreJ >= 2 ? "TU GAGNES LE MATCH !" : "L'IA GAGNE LE MATCH !",
+          temps: 999
+        };
+      } else {
+        resetRound();
+        phase = "combat";
+      }
+    }
+    return;
+  }
+  if (phase === "matchFin") {
+    if (presse("Enter")) { phase = "menu"; announce = null; }
+    return;
+  }
+
+  // combat
+  roundTemps = Math.max(0, roundTemps - dt);
+  penserIA(dt);
+  physique(joueur, dt);
+  physique(ia, dt);
+  if (joueur.y >= SOL && ia.y >= SOL && joueur.facing !== (ia.x < joueur.x ? -1 : 1)) {
+    joueur.facing = ia.x < joueur.x ? -1 : 1;
+  }
+  majProjectiles(dt);
+  majEffets(dt);
+  if (roundTemps <= 0 && !vainqueurRound) {
+    if (joueur.pv >= ia.pv) { scoreJ++; vainqueurRound = "JOUEUR"; }
+    else { scoreI++; vainqueurRound = "IA"; }
+    phase = "roundFin";
+    announce = { texte: "TEMPS ÉCOULÉ  " + vainqueurRound + " GAGNE !", temps: 2 };
+  }
+}
+
+// --- dessin ---
+function fond() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#1b1b3a"); g.addColorStop(0.6, "#4a2b5e"); g.addColorStop(1, "#c65d54");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // lune
+  ctx.fillStyle = "#ffe9b0";
+  ctx.beginPath(); ctx.arc(W / 2, 190, 78, 0, Math.PI * 2); ctx.fill();
+  // silhouette de ville
+  ctx.fillStyle = "#181428";
+  const immeubles = [0,60,120,200,255,330,400,470,540,610,690,760,830,900];
+  immeubles.forEach((x, i) => {
+    const h = 70 + ((i * 37) % 90);
+    ctx.fillRect(x, SOL - h, 55, h);
+    ctx.fillStyle = "#ffd870";
+    for (let wy = SOL - h + 14; wy < SOL - 10; wy += 22)
+      for (let wx = x + 10; wx < x + 48; wx += 18)
+        if ((wx + wy + i) % 3 !== 0) ctx.fillRect(wx, wy, 6, 8);
+    ctx.fillStyle = "#181428";
+  });
+  // sol
+  ctx.fillStyle = "#2a2333"; ctx.fillRect(0, SOL, W, H - SOL);
+  ctx.fillStyle = "#3d3447"; ctx.fillRect(0, SOL, W, 6);
+  ctx.strokeStyle = "#4a4055"; ctx.lineWidth = 2;
+  for (let x = 0; x < W; x += 48) {
+    ctx.beginPath(); ctx.moveTo(x, SOL + 6); ctx.lineTo(x - 20, H); ctx.stroke();
+  }
+}
+
+function barrePV(f, x, y, inverse) {
+  const w = 360, h = 22;
+  ctx.fillStyle = "#000"; ctx.fillRect(x - 2, y - 2, w + 4, h + 4);
+  ctx.fillStyle = "#3a1f28"; ctx.fillRect(x, y, w, h);
+  const ratio = Math.max(0, f.pv / 100);
+  const largeur = Math.round(w * ratio);
+  ctx.fillStyle = f.couleur;
+  ctx.fillRect(inverse ? x + w - largeur : x, y, largeur, h);
+  ctx.strokeStyle = "#e8e8f5"; ctx.lineWidth = 1;
+  ctx.strokeRect(x - 0.5, y - 0.5, w + 1, h + 1);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 14px Trebuchet MS";
+  ctx.textAlign = inverse ? "right" : "left";
+  ctx.fillText(f.nom, inverse ? x + w : x, y - 8);
+  // victoires
+  ctx.textAlign = "left";
+  for (let i = 0; i < 2; i++) {
+    ctx.beginPath();
+    ctx.arc((inverse ? x + w - 14 : x + 14) + (inverse ? -i * 22 : i * 22), y + h + 16, 7, 0, Math.PI * 2);
+    ctx.fillStyle = i < f.victoires ? "#ffd34d" : "#0006";
+    ctx.fill(); ctx.strokeStyle = "#e8e8f5"; ctx.stroke();
+  }
+}
+
+function dessinerCombattant(f) {
+  const x = Math.round(f.x), sol = Math.round(f.y);
+  const dir = f.facing;
+  ctx.save();
+  ctx.translate(x, sol);
+  ctx.scale(dir, 1);
+
+  const ko = f.etat === "ko";
+  if (ko) ctx.rotate(-0.9 * dir);
+  ctx.globalAlpha = f.hitstun > 0 ? 0.7 : 1;
+
+  const enL = f.coup === "pied";
+  const enP = f.coup === "poing" || f.coup === "boule";
+  const jambeAvant = enL ? -34 : 14;
+  const saut = f.y < SOL - 2;
+
+  ctx.lineWidth = 5; ctx.lineCap = "round";
+  // jambes
+  ctx.strokeStyle = "#222";
+  ctx.beginPath();
+  ctx.moveTo(0, -42); ctx.lineTo(saut ? -8 : -16, -2);
+  ctx.moveTo(0, -42); ctx.lineTo(jambeAvant + 8, saut ? -18 : 0);
+  ctx.stroke();
+  // torse
+  ctx.fillStyle = f.couleur;
+  ctx.fillRect(-16, -80, 32, 42);
+  ctx.strokeStyle = "#111"; ctx.lineWidth = 3;
+  ctx.strokeRect(-16, -80, 32, 42);
+  // ceinture
+  ctx.fillStyle = "#111"; ctx.fillRect(-16, -50, 32, 6);
+  // bras arrière
+  ctx.strokeStyle = f.couleur; ctx.lineWidth = 7;
+  ctx.beginPath();
+  ctx.moveTo(-10, -72);
+  ctx.lineTo(f.garde ? 6 : -20, f.garde ? -46 : -30);
+  ctx.stroke();
+  // bras avant ( coup )
+  ctx.beginPath(); ctx.moveTo(10, -72);
+  if (enP) ctx.lineTo(f.coup === "boule" ? 34 : 44, -64);
+  else if (f.garde) ctx.lineTo(22, -48);
+  else ctx.lineTo(20, -32);
+  ctx.stroke();
+  // tête
+  ctx.fillStyle = "#f0c9a0";
+  ctx.beginPath(); ctx.arc(0, -94, 13, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "#111"; ctx.lineWidth = 2; ctx.stroke();
+  // bandeau / œil
+  ctx.fillStyle = f.couleur; ctx.fillRect(-13, -100, 26, 7);
+  ctx.fillStyle = "#111"; ctx.fillRect(3, -93, 5, 3);
+
+  if (f.garde) { // bouclier
+    ctx.strokeStyle = "#9fd0ffaa"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(28, -58, 26, -1.1, 1.1); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function dessiner() {
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+  fond();
+
+  for (const p of projectiles) {
+    ctx.fillStyle = p.couleur;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 13, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#fff8";
+    ctx.beginPath(); ctx.arc(p.x - 3, p.y - 3, 5, 0, Math.PI * 2); ctx.fill();
+  }
+
+  dessinerCombattant(joueur);
+  dessinerCombattant(ia);
+
+  for (const e of effets) {
+    ctx.globalAlpha = Math.min(1, e.vie * 3);
+    ctx.fillStyle = e.couleur;
+    ctx.fillRect(e.x - 3, e.y - 3, 6, 6);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // HUD
+  barrePV(joueur, 40, 32, false);
+  barrePV(ia, W - 400, 32, true);
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 40px Trebuchet MS"; ctx.textAlign = "center";
+  ctx.fillText(String(Math.ceil(roundTemps)).padStart(2, "0"), W / 2, 62);
+
+  if (announce) {
+    ctx.fillStyle = "#0009"; ctx.fillRect(0, H / 2 - 56, W, 112);
+    ctx.fillStyle = "#ffd34d";
+    ctx.font = "bold 46px Trebuchet MS"; ctx.textAlign = "center";
+    ctx.fillText(announce.texte, W / 2, H / 2 + 16);
+  }
+
+  if (phase === "menu") {
+    ctx.fillStyle = "#000a"; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ff5b5b"; ctx.font = "bold 76px Trebuchet MS";
+    ctx.fillText("ARCADE COMBAT", W / 2, 190);
+    ctx.fillStyle = "#ffd34d"; ctx.font = "bold 26px Trebuchet MS";
+    ctx.fillText("Affronte l'IA — premier à 2 victoires", W / 2, 240);
+    ctx.fillStyle = "#fff"; ctx.font = "20px Trebuchet MS";
+    ctx.fillText("Entrée pour combattre", W / 2, 330);
+    ctx.fillStyle = "#9a9ab8"; ctx.font = "15px Trebuchet MS";
+    ctx.fillText("A/D bouger  •  W sauter  •  S garder", W / 2, 380);
+    ctx.fillText("J poing  •  K pied  •  L boule de feu", W / 2, 404);
+  }
+}
+
+// --- boucle ---
+let dernier = performance.now();
+function boucle(now) {
+  const dt = Math.min(0.033, (now - dernier) / 1000);
+  dernier = now;
+  maj(dt);
+  dessiner();
+  requestAnimationFrame(boucle);
+}
+
+// état initial
+phase = "menu";
+resetRound();
+announce = null;
+requestAnimationFrame(boucle);
+</script>
+</body>
+</html>
